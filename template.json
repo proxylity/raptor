@@ -1,0 +1,867 @@
+{
+  "Description": "S3 Upload/Download System using RaptorQ. For use with the Raptor CLI.",
+  "Transform": [
+    "AWS::LanguageExtensions",
+    "AWS::Serverless-2016-10-31"
+  ],
+  "Parameters": {
+    "ExistingBucketName": {
+      "Type": "String",
+      "Description": "Name of an existing S3 bucket to use for storing reassembled objects. If not provided, a new bucket will be created.",
+      "Default": ""
+    },
+    "BucketPrefix": {
+      "Type": "String",
+      "Default": "decoded/",
+      "Description": "The prefix to prepend to keys for storing the reassembled objects."
+    },
+    "FirstPeerPublicKey": {
+      "Type": "String",
+      "Description": "The public key of the first peer in base64 format. Required. To add additional peers, edit the Peers section of the Listener resource in this template file."
+    },
+    "ClientCidrToAllow": {
+      "Type": "String",
+      "Description": "The CIDR range to allow access to the RaptorQ decoder listener. Required. To restrict access to your current public IP address, use `echo $(curl https://checkip.amazonaws.com --silent)/32`."
+    },
+    "EncoderDefaultRepairOverhead": {
+      "Type": "String",
+      "Default": "0.05",
+      "Description": "For use in encoder Lambda. Fraction of additional repair symbols beyond K source symbols (defaults to 0.05, = 5% overhead)."
+    }
+  },
+  "Mappings": {
+    "ProxylityConfig": {
+      "Fn::Transform": {
+        "Name": "AWS::Include",
+        "Parameters": {
+          "Location": {
+            "Fn::Sub": "s3://proxylity-config-${AWS::Region}/${AWS::AccountId}/customer-config.json"
+          }
+        }
+      }
+    }
+  },
+  "Conditions": {
+    "CreateBucket": {
+      "Fn::Equals": [
+        {
+          "Ref": "ExistingBucketName"
+        },
+        ""
+      ]
+    }
+  },
+  "Resources": {
+    "RoleForProxylity": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::FindInMap": [
+                    "ProxylityConfig",
+                    {
+                      "Ref": "AWS::Region"
+                    },
+                    "ServiceRole"
+                  ]
+                }
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }
+      }
+    },
+    "ProxylityLambdaInvokePolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "ProxylityLambdaInvokePolicy",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "sqs:GetQueueUrl",
+                "sqs:SendMessage"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "IngestionQueue",
+                  "Arn"
+                ]
+              }
+            }
+          ]
+        },
+        "Roles": [
+          {
+            "Ref": "RoleForProxylity"
+          }
+        ]
+      }
+    },
+    "ProxylitySubscribeToTopicPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "ProxylitySubscribeToTopicPolicy",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "SubscriptionManagement",
+              "Effect": "Allow",
+              "Action": [
+                "sns:Subscribe",
+                "sns:Unsubscribe",
+                "sns:ListSubscriptionsByTopic"
+              ],
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "ReplyTopic",
+                    "TopicArn"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "Roles": [
+          {
+            "Ref": "RoleForProxylity"
+          }
+        ]
+      }
+    },
+    "InFlightTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "TableName": {
+          "Fn::Sub": "${AWS::StackName}-inflight"
+        },
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "PK",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "SK",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "PK",
+            "KeyType": "HASH"
+          },
+          {
+            "AttributeName": "SK",
+            "KeyType": "RANGE"
+          }
+        ],
+        "TimeToLiveSpecification": {
+          "AttributeName": "Expires",
+          "Enabled": true
+        }
+      }
+    },
+    "IngestionQueue": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "QueueName": {
+          "Fn::Sub": "${AWS::StackName}-ingestion-queue"
+        },
+        "VisibilityTimeout": 5,
+        "MessageRetentionPeriod": 60
+      }
+    },
+    "ReplyTopic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {
+        "DisplayName": {
+          "Fn::Sub": "${AWS::StackName} Reply Topic"
+        }
+      }
+    },
+    "CompletionQueue": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "QueueName": {
+          "Fn::Sub": "${AWS::StackName}-completion-queue.fifo"
+        },
+        "FifoQueue": true,
+        "DeduplicationScope": "messageGroup",
+        "FifoThroughputLimit": "perMessageGroupId",
+        "VisibilityTimeout": 5,
+        "MessageRetentionPeriod": 60
+      }
+    },
+    "ReceivedObjectsBucket": {
+      "Condition": "CreateBucket",
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketName": {
+          "Fn::Sub": "${AWS::StackName}-objects-${AWS::AccountId}"
+        },
+        "MetricsConfigurations": [
+          {
+            "Id": "ByPrefix",
+            "Prefix": {
+              "Ref": "BucketPrefix"
+            }
+          }
+        ],
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "ExpireReassembledObjects",
+              "Status": "Enabled",
+              "ExpirationInDays": 28
+            },
+            {
+              "Id": "AbortIncompleteMultipartUploads",
+              "Status": "Enabled",
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 2
+              }
+            }
+          ]
+        }
+      }
+    },
+    "DecoderListener": {
+      "Type": "Custom::ProxylityUdpGatewayListener",
+      "Properties": {
+        "ServiceToken": {
+          "Fn::FindInMap": [
+            "ProxylityConfig",
+            {
+              "Ref": "AWS::Region"
+            },
+            "ServiceToken"
+          ]
+        },
+        "ApiKey": {
+          "Fn::FindInMap": [
+            "ProxylityConfig",
+            "Account",
+            "ApiKey"
+          ]
+        },
+        "Protocols": [
+          "wg"
+        ],
+        "Peers": [
+          {
+            "PublicKey": {
+              "Ref": "FirstPeerPublicKey"
+            }
+          }
+        ],
+        "ClientRestrictions": {
+          "Networks": [
+            {
+              "Ref": "ClientCidrToAllow"
+            }
+          ]
+        },
+        "Destinations": [
+          {
+            "Name": "RaptorQPacketQueue",
+            "Role": {
+              "Arn": {
+                "Fn::GetAtt": [
+                  "RoleForProxylity",
+                  "Arn"
+                ]
+              }
+            },
+            "Batching": {
+              "Count": 10,
+              "TimeoutInSeconds": 0.05
+            },
+            "DestinationArn": {
+              "Fn::GetAtt": [
+                "IngestionQueue",
+                "Arn"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ConfirmSource": {
+      "DependsOn": [
+        "ProxylitySubscribeToTopicPolicy"
+      ],
+      "Type": "Custom::ProxylityUdpGatewayPacketSource",
+      "Properties": {
+        "ServiceToken": {
+          "Fn::FindInMap": [
+            "ProxylityConfig",
+            {
+              "Ref": "AWS::Region"
+            },
+            "ServiceToken"
+          ]
+        },
+        "ApiKey": {
+          "Fn::FindInMap": [
+            "ProxylityConfig",
+            "Account",
+            "ApiKey"
+          ]
+        },
+        "Enabled": true,
+        "ListenerName": {
+          "Ref": "DecoderListener"
+        },
+        "SnsTopicSource": {
+          "Role": {
+            "Fn::GetAtt": [
+              "RoleForProxylity",
+              "Arn"
+            ]
+          },
+          "TopicArn": {
+            "Fn::GetAtt": [
+              "ReplyTopic",
+              "TopicArn"
+            ]
+          }
+        }
+      }
+    },
+    "PacketIngestorLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ]
+      }
+    },
+    "PacketIngestorPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "PacketIngestorPolicy",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "IngestionQueue",
+                  "Arn"
+                ]
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:BatchWriteItem"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "InFlightTable",
+                  "Arn"
+                ]
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "sns:Publish"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "ReplyTopic",
+                  "TopicArn"
+                ]
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "sqs:SendMessage"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "CompletionQueue",
+                  "Arn"
+                ]
+              }
+            }
+          ]
+        },
+        "Roles": [
+          {
+            "Ref": "PacketIngestorLambdaRole"
+          }
+        ]
+      }
+    },
+    "PacketIngestorEventSourceMapping": {
+      "Type": "AWS::Lambda::EventSourceMapping",
+      "Properties": {
+        "EventSourceArn": {
+          "Fn::GetAtt": [
+            "IngestionQueue",
+            "Arn"
+          ]
+        },
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "PacketIngestorLambda",
+            "Arn"
+          ]
+        },
+        "FunctionResponseTypes": [
+          "ReportBatchItemFailures"
+        ]
+      }
+    },
+    "EncoderLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ]
+      }
+    },
+    "EncoderLambdaPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "EncoderLambdaPolicy",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:HeadObject"
+              ],
+              "Resource": {
+                "Fn::If": [
+                  "CreateBucket",
+                  {
+                    "Fn::Sub": "arn:aws:s3:::${ReceivedObjectsBucket}/*"
+                  },
+                  {
+                    "Fn::Sub": "arn:aws:s3:::${ExistingBucketName}/*"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "Roles": [
+          {
+            "Ref": "EncoderLambdaRole"
+          }
+        ]
+      }
+    },
+    "PacketIngestorLambda": {
+      "Type": "AWS::Serverless::Function",
+      "Metadata": {
+        "BuildMethod": "makefile"
+      },
+      "Properties": {
+        "Handler": "bootstrap",
+        "Runtime": "provided.al2023",
+        "CodeUri": "./src/",
+        "Architectures": [
+          "x86_64"
+        ],
+        "MemorySize": 1024,
+        "Timeout": 5,
+        "Role": {
+          "Fn::GetAtt": [
+            "PacketIngestorLambdaRole",
+            "Arn"
+          ]
+        },
+        "Environment": {
+          "Variables": {
+            "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT": "1",
+            "TABLE_NAME": {
+              "Ref": "InFlightTable"
+            },
+            "BLOCK_COMPLETER_QUEUE_URL": {
+              "Ref": "CompletionQueue"
+            },
+            "REPLY_TOPIC_ARN": {
+              "Fn::GetAtt": [
+                "ReplyTopic",
+                "TopicArn"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "BlockCompleterLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ]
+      }
+    },
+    "BlockCompleterPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "BlockCompleterPolicy",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowSnsPublish",
+              "Effect": "Allow",
+              "Action": [
+                "sns:Publish"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "ReplyTopic",
+                  "TopicArn"
+                ]
+              }
+            },
+            {
+              "Sid": "AllowSqsReceiveMessage",
+              "Effect": "Allow",
+              "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "CompletionQueue",
+                  "Arn"
+                ]
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:DeleteItem",
+                "dynamodb:Query"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "InFlightTable",
+                  "Arn"
+                ]
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:PutObject",
+                "s3:GetObject",
+                "s3:AbortMultipartUpload",
+                "s3:ListMultipartUploadParts"
+              ],
+              "Resource": {
+                "Fn::If": [
+                  "CreateBucket",
+                  {
+                    "Fn::Sub": "arn:aws:s3:::${ReceivedObjectsBucket}/*"
+                  },
+                  {
+                    "Fn::Sub": "arn:aws:s3:::${ExistingBucketName}/*"
+                  }
+                ]
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:PutObject",
+                "s3:GetObject",
+                "s3:DeleteObject"
+              ],
+              "Resource": {
+                "Fn::If": [
+                  "CreateBucket",
+                  {
+                    "Fn::Sub": "arn:aws:s3:::${ReceivedObjectsBucket}/staging/*"
+                  },
+                  {
+                    "Fn::Sub": "arn:aws:s3:::${ExistingBucketName}/staging/*"
+                  }
+                ]
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:CreateMultipartUpload",
+                "s3:CompleteMultipartUpload",
+                "s3:ListBucketMultipartUploads"
+              ],
+              "Resource": {
+                "Fn::If": [
+                  "CreateBucket",
+                  {
+                    "Fn::Sub": "arn:aws:s3:::${ReceivedObjectsBucket}"
+                  },
+                  {
+                    "Fn::Sub": "arn:aws:s3:::${ExistingBucketName}"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "Roles": [
+          {
+            "Ref": "BlockCompleterLambdaRole"
+          }
+        ]
+      }
+    },
+    "BlockCompleterLambda": {
+      "Type": "AWS::Serverless::Function",
+      "Metadata": {
+        "BuildMethod": "makefile"
+      },
+      "Properties": {
+        "Handler": "bootstrap",
+        "Runtime": "provided.al2023",
+        "CodeUri": "./src/",
+        "Architectures": [
+          "x86_64"
+        ],
+        "MemorySize": 4096,
+        "Timeout": 5,
+        "Role": {
+          "Fn::GetAtt": [
+            "BlockCompleterLambdaRole",
+            "Arn"
+          ]
+        },
+        "Environment": {
+          "Variables": {
+            "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT": "1",
+            "TABLE_NAME": {
+              "Ref": "InFlightTable"
+            },
+            "BUCKET_NAME": {
+              "Fn::If": [
+                "CreateBucket",
+                {
+                  "Ref": "ReceivedObjectsBucket"
+                },
+                {
+                  "Ref": "ExistingBucketName"
+                }
+              ]
+            },
+            "BUCKET_PREFIX": {
+              "Ref": "BucketPrefix"
+            },
+            "REPLY_TOPIC_ARN": {
+              "Fn::GetAtt": [
+                "ReplyTopic",
+                "TopicArn"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "BlockCompleterEventSourceMapping": {
+      "Type": "AWS::Lambda::EventSourceMapping",
+      "Properties": {
+        "EventSourceArn": {
+          "Fn::GetAtt": [
+            "CompletionQueue",
+            "Arn"
+          ]
+        },
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "BlockCompleterLambda",
+            "Arn"
+          ]
+        },
+        "BatchSize": 10
+      }
+    },
+    "EncoderLambda": {
+      "Type": "AWS::Serverless::Function",
+      "Metadata": {
+        "BuildMethod": "makefile"
+      },
+      "Properties": {
+        "Handler": "bootstrap",
+        "Runtime": "provided.al2023",
+        "CodeUri": "./src/",
+        "Architectures": [
+          "x86_64"
+        ],
+        "MemorySize": 4096,
+        "Timeout": 30,
+        "Role": {
+          "Fn::GetAtt": [
+            "EncoderLambdaRole",
+            "Arn"
+          ]
+        },
+        "Environment": {
+          "Variables": {
+            "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT": "1",
+            "REPAIR_OVERHEAD": {
+              "Ref": "EncoderDefaultRepairOverhead"
+            },
+            "DECODER_HOST": {
+              "Fn::Sub": "${DecoderListener.Domain}.proxylity.com"
+            },
+            "DECODER_PORT": {
+              "Fn::GetAtt": [
+                "DecoderListener",
+                "Port"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "PacketIngestorLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${PacketIngestorLambda}"
+        },
+        "RetentionInDays": 14
+      }
+    },
+    "BlockCompleterLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${BlockCompleterLambda}"
+        },
+        "RetentionInDays": 14
+      }
+    },
+    "EncoderLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${EncoderLambda}"
+        },
+        "RetentionInDays": 14
+      }
+    }
+  },
+  "Outputs": {
+    "TableName": {
+      "Description": "DynamoDB table for in-flight RaptorQ state.",
+      "Value": {
+        "Ref": "InFlightTable"
+      }
+    },
+    "BucketName": {
+      "Description": "S3 bucket for reassembled objects.",
+      "Value": {
+        "Fn::If": [
+          "CreateBucket",
+          {
+            "Ref": "ReceivedObjectsBucket"
+          },
+          {
+            "Ref": "ExistingBucketName"
+          }
+        ]
+      }
+    },
+    "EncoderLambdaArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "EncoderLambda",
+          "Arn"
+        ]
+      }
+    },
+    "DecoderListenerHost": {
+      "Value": {
+        "Fn::Sub": "${DecoderListener.Domain}.proxylity.com"
+      }
+    },
+    "DecoderListenerPort": {
+      "Value": {
+        "Fn::GetAtt": [
+          "DecoderListener",
+          "Port"
+        ]
+      }
+    },
+    "DecoderListenerPublicKey": {
+      "Value": {
+        "Fn::GetAtt": [
+          "DecoderListener",
+          "WireGuardPublicKey"
+        ]
+      }
+    }
+  }
+}

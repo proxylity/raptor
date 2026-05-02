@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/raptor-cli/raptor-cli.csproj" />
+    <Project Path="src/raptorq-lib/raptorq-lib.csproj" />
+    <Project Path="src/raptorq-tests/raptorq-tests.csproj" />
+  </Folder>
+  <Folder Name="/src/raptorq-block-completer/">
+    <Project Path="src/raptorq-block-completer/Function.csproj" />
+  </Folder>
+  <Folder Name="/src/raptorq-encoder-lambda/">
+    <Project Path="src/raptorq-encoder-lambda/Function.csproj" />
+  </Folder>
+  <Folder Name="/src/raptorq-packet-ingestor/">
+    <Project Path="src/raptorq-packet-ingestor/Function.csproj" />
+  </Folder>
+</Solution>
