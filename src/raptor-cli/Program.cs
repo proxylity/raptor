@@ -142,7 +142,7 @@ async Task reply_worker()
                             } // already completed
                         } // else await log($"Received confirmation for object {objectid} block {packet.BlockIndex} but no matching inflight block found.", LogLevel.WARNING);
                     } else await log($"Received confirmation with signal {packet.NotificationType} below configured level {config.ConfirmationLevel}, ignoring.", LogLevel.DETAIL);
-                } await log($"Object {packet.ObjectId} block {packet.BlockIndex}: Server reports {packet.NotificationData} packets received.", LogLevel.DETAIL);
+                } else await log($"Object {packet.ObjectId} block {packet.BlockIndex}: Server reports {packet.NotificationData} packets received.", LogLevel.DETAIL);
             } else await log($"Received invalid confirmation packet: {Encoding.UTF8.GetString(reply.Span)}", LogLevel.WARNING);
         }
     } else await log("Confirmation disabled; not listening for replies.", LogLevel.DETAIL);
