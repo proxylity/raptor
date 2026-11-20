@@ -1,14 +1,14 @@
-﻿namespace Proxylity.RaptorQ;
+namespace Proxylity.RaptorQ;
 
 /// <summary>
 /// RFC 6330 systematic RaptorQ decoder for a single source block.
 ///
 /// Recovers K source symbols from any K or more linearly-independent received
-/// encoded symbols using the inactivation decoder (§5.4.2).
+/// encoded symbols using the inactivation decoder (�5.4.2).
 /// </summary>
 public class RaptorQDecoder
 {
-    private const int SmallErasureThreshold = 32;
+    private const int SmallErasureThreshold = 0;
 
     private readonly int _K;
     private readonly int _symbolSize;
@@ -45,7 +45,7 @@ public class RaptorQDecoder
         var p = RaptorQParameters.Compute(_K);
         int L = p.L;
 
-        // Build the sparse L×L constraint matrix (LDPC rows 0..S-1, HDPC rows S..S+H-1,
+        // Build the sparse L�L constraint matrix (LDPC rows 0..S-1, HDPC rows S..S+H-1,
         // LT rows S+H..L-1 for ISI 0..K'-1) exactly as the encoder does.
         // This provides the S+H pre-coding constraint equations plus K' LT equations.
         var A = RaptorQCodec.BuildConstraintMatrixSparse(p);
@@ -96,7 +96,7 @@ public class RaptorQDecoder
             freeSlot++;
 
             // Overwrite the LT coefficients for the original ISI with those of this repair symbol.
-            // ISI = ESI + (K'-K) for repair symbols (RFC 6330 §5.3.3.2).
+            // ISI = ESI + (K'-K) for repair symbols (RFC 6330 �5.3.3.2).
             int isi = esi + (p.K_prime - _K);
             RaptorQParameters.EncSymbolIndices(p.K_prime, isi, p, indices, out int cnt);
             A.SetSparseRow(destRow, indices, cnt);
@@ -216,7 +216,9 @@ public class RaptorQDecoder
             smallD.CopyFrom(row, residual);
         }
 
-        SymbolSlab? solved = RaptorQSolver.Solve(smallA, smallD, missingCount);
+        // A plain dense GF(256) elimination. The RaptorQ solver is built for the structured constraint
+        // matrix and returned wrong symbols for some of these small dense systems.
+        SymbolSlab? solved = SolveDense(smallA, smallD, missingCount);
         if (solved == null)
             return false;
 
@@ -227,6 +229,40 @@ public class RaptorQDecoder
             _sourceSymbols[missingIndices[i]] = solved.Get(i).ToArray();
 
         return true;
+    }
+
+    /// <summary>Gauss-Jordan elimination of A x = D over GF(256) for a small dense n x n system. Returns D (rows = x) or null if singular.</summary>
+    internal static SymbolSlab? SolveDense(byte[,] A, SymbolSlab D, int n)
+    {
+        for (int col = 0; col < n; col++)
+        {
+            int pivot = col;
+            while (pivot < n && A[pivot, col] == 0) pivot++;
+            if (pivot == n) return null;
+            if (pivot != col)
+            {
+                for (int c = 0; c < n; c++) (A[col, c], A[pivot, c]) = (A[pivot, c], A[col, c]);
+                var tmp = D.Get(col).ToArray();
+                D.CopyFrom(col, D.Get(pivot));
+                D.CopyFrom(pivot, tmp);
+            }
+            byte inv = GF256.Inverse(A[col, col]);
+            if (inv != 1)
+            {
+                for (int c = 0; c < n; c++) A[col, c] = GF256.Multiply(A[col, c], inv);
+                D.Scale(col, inv);
+            }
+            for (int r = 0; r < n; r++)
+            {
+                if (r == col) continue;
+                byte factor = A[r, col];
+                if (factor == 0) continue;
+                for (int c = 0; c < n; c++) A[r, c] ^= GF256.Multiply(factor, A[col, c]);
+                if (factor == 1) D.XorAssign(r, col);
+                else D.AddScaled(r, col, factor);
+            }
+        }
+        return D;
     }
 
     private byte[,] BuildSmallErasureCoefficientMatrix(int[] missingIndices, List<(int esi, byte[] sym)> repairSymbols)

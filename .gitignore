@@ -486,3 +486,11 @@ $RECYCLE.BIN/
 .aws-sam/
 
 data/
+# raptor2 build output and benchmark data
+microvm/build/
+microvm/.aws-sam/
+bench-data/
+bench-results/
+
+# SAM CLI saves deploy choices here (stack name, region, parameter values such as your client IP)
+samconfig.toml

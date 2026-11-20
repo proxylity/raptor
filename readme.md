@@ -1,270 +1,213 @@
 # Raptor: Fast Small File Transfers to S3
 
-![Timing comparison of raptor CLI versus S3 CLI for uploading 100 1KB files.](./images/raptor-vs-s3-cp-100-1kb-files.png)
+![Upload time for small files: raptor on Lambda MicroVMs against the original raptor and the AWS CLI](images/bench-time-all.svg)
 
-This dependendcy-free native executable and serverless backend delivers **small files** to S3 fast. Much faster than the S3 CLI. Perhaps most importantly, it does so using a tiny fraction of the CPU time, saving energy and keeping our datacenters (and planet) a little cooler.
+Raptor puts small files into S3 faster than the AWS CLI, using a fraction of the client CPU. It doesn't use HTTP, TLS
+or TCP. The client encodes each file with RaptorQ and fires the symbols at a [Proxylity UDP
+Gateway](https://proxylity.com) listener over UDP (optionally inside WireGuard). The gateway batches them to a pool of
+[Lambda MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html), which reassemble the files
+in memory and write them to your bucket. There is no handshake before the data, and no per-packet storage behind it.
 
 ## Background
 
-Moving small files to S3 is slow, and largely remains so. AWS has done significant work to improve S3 throughput, including the [Common Runtime (CRT) transfer client](https://github.com/awslabs/aws-c-s3) and [CLI transfer configuration](https://docs.aws.amazon.com/cli/latest/topic/s3-config.html#preferred-transfer-client). But these optimizations only go so far. S3's API is based on HTTPS, and the [expected floor for small object latency is ~100-200 ms per request](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html). For small files (less than ~10 KB) the TLS protocol overhead is substantial; for very small files (~1 KB) it dominates the overall transfer time and compute.
+Moving small files to S3 is slow. AWS has done a lot to raise S3 throughput, including the [Common Runtime (CRT)
+transfer client](https://github.com/awslabs/aws-c-s3) and the [native (Rust) AWS CLI](https://github.com/aws/aws-cli/issues/10912),
+but S3's API is HTTPS, and the [expected floor for small object latency is about 100-200 ms per
+request](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html). For files under about
+10 KB the TLS and HTTP overhead dominates both the time and the CPU.
 
-This project (raptor) doesn't use HTTP, TLS or TCP. Instead, files are transferred to S3 over UDP using RaptorQ encoding and optionally protected by WireGuard's encryption.
+[RaptorQ](https://datatracker.ietf.org/doc/html/rfc6330) is a fountain code: any large enough set of encoded symbols,
+in any order, rebuilds the original. That makes it a good fit for fire-and-forget delivery over UDP, where some
+packets are lost and the rest arrive in any order.
 
-RaptorQ is defined in [RFC 6330](https://datatracker.ietf.org/doc/html/rfc6330) and is a "fountain code" for encoding objects into "symbols" ( chunks) in a way that allows reliable reconstruction over lossy connections. Any sufficiently-large subset of received encoded symbols (regardless of which ones arrive, or in what order) can be used to reconstruct the original object. This makes it well-suited for high-throughput, fire-and-forget file delivery over UDP.
+## How it works
 
-In this repo you'll find a complete implemention of a "RaptorQ over UDP to S3" file transfer system:
+```mermaid
+graph LR
+cli[raptor CLI]-->|UDP: RaptorQ symbols, slot in byte 1|gw[Proxylity UDP Gateway]
+gw-->|HTTPS batches, one tenant per slot|vm[Lambda MicroVMs: slots 0-3]
+vm-->|PutObject|s3[(S3 bucket)]
+vm-.->|HAVE replies|gw-.->|UDP|cli
+```
 
-- The `raptor` **CLI tool** encodes a local file and sends it to the decoder endpoint.
-- A **decoder backend** on AWS (SQS + Lambda + DynamoDB + S3) reassembles objects from incoming encoded packets delivered via Proxylity UDP Gateway.
-- A **shared C# library** implementing the RaptorQ encoder/decoder (GF(256) arithmetic, intermediate symbol generation, constraint matrix, Gaussian elimination).
+1. **The client sends without asking first.** Every datagram says what it belongs to: a random transfer ID, the
+   file's index and size, its block and symbol number, and (in some packets) its S3 key. A 1 KiB file is two
+   datagrams: one source symbol and one repair symbol. The number of repair symbols adapts to the loss the client
+   measures.
+2. **The slot is the tenant.** The client writes a slot number into byte 1 of each datagram, chosen from the transfer
+   ID and the file, and the gateway's `TenantIdExpression: "[1:2]"` routes each slot to its own MicroVM. Slots are
+   shared by all uploads, so the MicroVMs stay warm.
+3. **The MicroVM holds the state.** It keeps each file's symbols in memory until it has enough, decodes if
+   anything was lost, and writes the file with one `PutObject`. Only then does it answer, in the HTTP response to the
+   batch that completed the file. The gateway sends that reply to the client as a UDP datagram.
+4. **The client repairs what's missing.** Files with no reply get a `STATUS` query after a short timeout, and then
+   exactly the symbols the MicroVM says it still needs.
 
-The CLI implementation targets **C# / .NET 10** with AoT for a small single file native executable. 
+### Why MicroVMs: where the state lives
 
-The backend infrastructure is serverless and defined in `template.json` (AWS SAM / CloudFormation). Lambda functions are also AoT compiled, native executables to minimize cold start and maximize performance. WireGuard termination, packet batching and response routing are provided by [Proxylity UDP Gateway](https://proxylity.com).
+The [original raptor](docs/original-design.md) ran the same protocol on Lambda functions. A function keeps no memory
+between invocations, and several invocations for one file can run at once, so the state had to live somewhere else:
 
-## Architecture
+| | Original: Lambda + SQS + DynamoDB | Now: Lambda MicroVMs |
+|---|---|---|
+| Where received symbols wait | One DynamoDB item per symbol | In the MicroVM's memory |
+| How a file is known to be complete | Atomic counters in DynamoDB, then a FIFO SQS message so it is decoded once | The MicroVM counts its own symbols |
+| Who decodes and writes to S3 | A second Lambda function, after reading the symbols back from DynamoDB | The same MicroVM, at once |
+| AWS calls per 1 KiB file | DynamoDB writes and reads, SQS messages, two Lambda invocations, several S3 requests | One `PutObject` |
+| Infrastructure | 2 queues, a table, 2 functions in the data path (and Lambda concurrency for them) | One MicroVM image |
 
-![Upload Architecture](images/architecture.svg)
+Each hop in the original added latency, and each file paid for DynamoDB writes. With the state in memory, a file is
+in S3 as soon as its last packet is processed.
 
-> **NOTE:** This examples uses DDB for keeping track of packets in flight, and that *can be* expensive (it isn't for light to moderate use). Using this stack only for small files is recommened. If you'd like to use this approach for very high volumes of files, check out the options for reducing costs discussed in the [cost analysis](docs/cost-analysis.md).
+## Benchmarks
 
-## Significant IaC Resources
+Uploads from a home connection (about 35 Mbps up) to us-west-2, from WSL 2 on Windows: 100, 500 and
+1,000 files of 1 KiB and of 10 KiB, each tool 3 times, interleaved. Times run from the start until every file is
+verified in S3. Details, raw data and caveats: [docs/benchmarks/small-files](docs/benchmarks/small-files/README.md).
 
-| Resource | Purpose |
+| Files | Lambda + DynamoDB (original) | **Lambda MicroVMs** | AWS CLI native preview | AWS CLI (Python) |
+|---|---|---|---|---|
+| 100 × 1 KiB | 29.3 s | **0.46 s** | 0.80 s | 1.32 s |
+| 500 × 1 KiB | 136 s | **0.53 s** | 1.46 s | 2.01 s |
+| 1,000 × 1 KiB | incomplete | **0.85 s** | 2.32 s | 4.76 s |
+| 100 × 10 KiB | 29.7 s | **0.55 s** | 0.82 s | 1.36 s |
+| 500 × 10 KiB | 135 s | 1.88 s | **1.72 s** | 2.23 s |
+| 1,000 × 10 KiB (1 run) | incomplete | 3.50 s | **2.96 s** | 5.11 s |
+
+- **1 KiB files:** 1.7 to 2.8 times faster than the native AWS CLI, with 12-42% of its CPU time, and
+  64 to 260 times faster than the original design.
+- **10 KiB files:** faster up to a few hundred files. Beyond that the uplink is the limit: both raptor CLIs were capped
+  at 30 Mbps, and the AWS CLI used the whole 35-38 Mbps.
+- The original design ran in an account with a Lambda concurrency limit of 10, which throttled it; "incomplete" means
+  files were still missing two minutes after its CLI finished.
+
+![Upload time: Lambda + DynamoDB vs. Lambda MicroVMs](images/bench-time-old-vs-new.svg)
+
+![Client CPU time](images/bench-cpu-all.svg)
+
+### With packet loss
+
+On a lossy link the difference grows. With simulated loss (`tc netem`, outbound packets on the client), 500 files of
+10 KiB, where the two were closest without loss:
+
+| Loss | **Lambda MicroVMs** | AWS CLI native preview |
+|---|---|---|
+| 0% | 1.88 s | **1.75 s** |
+| 1% | 2.24 s | **1.92 s** |
+| 5% | **2.24 s** | 2.64 s |
+| 10% | **2.33 s** | 3.80 s |
+| 20% | **3.11 s** | 19.9 s |
+
+![Upload time with packet loss](images/bench-packet-loss.svg)
+
+Raptor sends repair symbols in proportion to the loss it measures, so lost packets don't cost round trips. TCP
+treats every loss as congestion and slows down. Details: [docs/benchmarks/packet-loss](docs/benchmarks/packet-loss/README.md).
+The comparison tools are the [AWS CLI native preview](https://github.com/aws/aws-cli/issues/10912) (`2.40.0-preview1`,
+Rust path, CRT client) and the same CLI on its Python path, both with `aws s3 cp --recursive`.
+
+## Getting started
+
+Prerequisites: Linux or WSL 2 with the .NET 10 SDK and gcc or clang, SAM CLI, an AWS CLI with the
+`lambda-microvms` commands, `jq` and `zip`, and a [Proxylity UDP Gateway
+subscription](https://aws.amazon.com/marketplace/pp/prodview-cpvl5wgt2yo2e) (a free tier is available).
+
+```bash
+microvm/scripts/deploy.sh                       # builds, deploys stack raptor2 in us-west-2, prints the endpoint
+microvm/build/cli/raptor2 photos udp://<host>:<port> --recursive
+aws s3 ls s3://<bucket>/decoded/ --recursive
+```
+
+`deploy.sh` allows only your current public IP address to send to the listener (`CLIENT_CIDR` changes it). It creates
+a bucket named `<stack>-objects-<account>` unless you pass `ExistingBucketName`. See [microvm/](microvm/README.md) for
+deployment options, local testing without AWS, and operating notes.
+
+## CLI
+
+```
+raptor2 <file|folder> <udp|wg>://<host>:<port> [options]
+
+  --recursive             include subfolders
+  --prefix <p>            key prefix (default: a UTC timestamp); --no-prefix uses the relative paths only
+  --rate-mbps <n>         send rate limit (default 10)
+  --small-slots <n>       MicroVMs to spread files across (default 4)
+  --max-size <n>          largest file to send (default 1MiB); see "Limits"
+  --overhead <f|auto>     repair symbols sent up front (default auto: adapts to the measured loss)
+  --timeout <s>           give up after this long without progress (default 60)
+  --no-confirm            fire and forget: don't wait for the files to be confirmed
+  --server-key/--client-key <base64>   WireGuard keys, for wg://
+  --verbose | --silent
+```
+
+The exit code is 0 when every file is in S3.
+
+## Limits
+
+- **Files up to 1 MiB by default.** Larger files are refused, with a pointer to `aws s3 cp`. `--max-size` raises the
+  limit: files over 16 MiB then go as S3 multipart uploads, with their parts spread over the large-file lanes
+  (`--large-slots`). That works, but it isn't benchmarked here, and it isn't the point: each MicroVM accepts a limited
+  number of requests per second, so large-file throughput costs MicroVM capacity that a direct S3 upload doesn't
+  need. See [the design notes](docs/design-microvm.md#file-size-limit-and-why).
+- **Object keys up to 95 bytes**, including the prefix.
+- **MicroVM memory quota.** Each slot in use is one MicroVM. The default quota is 8 GB, which is the CLI's default of
+  four 2 GB MicroVMs.
+- **The first upload after an idle period** resumes or starts the MicroVMs. A 1 KB upload took 0.9-4.4 s this way,
+  against 0.12-0.2 s with warm MicroVMs. Packets that arrive in the meantime are repaired.
+
+## Cost
+
+These are the AWS costs of the backend. Proxylity's per-packet charges are left out; they are the same for both designs.
+The MicroVM figures use the [published](https://aws.amazon.com/lambda/pricing/) Graviton (Arm) rates for us-east-1:
+$0.0000276944 per vCPU-second and $0.0000036667 per GB-second, $0.0038 per GB written to a snapshot (suspend) and
+$0.00155 per GB read from one (start or resume). Those rates apply if you deploy the Arm64 build
+(`RID=linux-arm64 microvm/scripts/deploy.sh`). The default x86_64 build and other regions are priced on the same page.
+
+**What you pay for**
+
+| Item | Unit cost | With the defaults (four 2 GB MicroVMs) |
+|---|---|---|
+| A MicroVM while it runs (2 GB, 1 vCPU baseline) | $0.126 an hour ($0.0021 a minute) | $0.50 an hour |
+| Suspending a MicroVM (writing its 2 GB snapshot) | $0.0076 | $0.030 |
+| Resuming or starting a MicroVM (reading its snapshot) | $0.0031 | $0.012 |
+| A suspended MicroVM's snapshot | $0.16 a month | $0.64 a month |
+| Each file: one S3 `PutObject` | $0.005 per 1,000 files | |
+
+A MicroVM runs from the first packet it receives until `IdleDurationSeconds` (900 by default) after the last one.
+Then it suspends, and the next packet resumes it. So the MicroVM cost depends on how long the MicroVMs stay awake, not
+on how many files they receive.
+
+**Examples**
+
+- **One upload of 1,000 small files after a quiet spell.** Resume ($0.012), about 15 minutes awake ($0.126), suspend
+  ($0.030), and 1,000 `PutObject`s ($0.005): **about $0.17 in all.** With `IdleDurationSeconds=60` the MicroVMs are
+  awake for about a minute ($0.008), and the total is **about $0.06**. More uploads in the same awake period add
+  only their `PutObject`s and the extra minutes.
+- **Steady traffic, so the MicroVMs never suspend.** $0.50 an hour, or about $370 a month. The four MicroVMs took
+  1,000 files in 0.85 s in the benchmark, so at full use that is well under a cent per 1,000 files on top of the
+  `PutObject`s.
+
+**Against the original design.** The original paid per file instead, with no cost while idle. A 1 KiB file was two
+packets, and each packet was a DynamoDB item, written and read back, plus counter and lock items: about $0.012 per
+1,000 files in DynamoDB (see [cost-analysis.md](docs/cost-analysis.md)). Each file also took four PUT-class S3 requests
+and a GET (create a multipart upload, put and get a staging object, upload a part, complete), about $0.02 per 1,000
+files. That is about $0.03 per 1,000 files, before Lambda, SQS and SNS charges. Against the MicroVMs' $0.005 per 1,000 plus $0.06-0.17
+per awake period, the MicroVMs cost less once an awake period carries more than about 2,000 files (with
+`IdleDurationSeconds=60`) or about 7,000 files (with the default).
+## Repository layout
+
+| Path | What it is |
 |---|---|
-| `DecoderListener` | Receives encoded UDP packets from the CLI or encoder Lambda |
-| `DecoderListener` Destination | Routes batches of JSON encoded packets to `IngestionQueue` |
-| `IngestionQueue` | Standard SQS Queue buffers packets to be received by `PacketIngestorLambda` |
-| `PacketIngestorLambda` | Stores received symbols in DynamoDB; Triggers `BlockCompleterLambda` when enough packets arrive |
-| `CompletionQueue` | FIFO SQS queue that groups by `objectId` and deduplicates on `{objectId}_{blockId}` so blocks are completed at most once | 
-| `BlockCompleterLambda` | Reads block packet data from DDB and decodes them, reassembles file from blocks as S3 object multipart upload | 
-| `InFlightTable` | Three item types per transfer: `METADATA/OVERALL` (multipart upload ID, completion counter), `COUNT/BLOCK` (per-block received-packet counter), and `PACKET` (individual encoded symbols); 4-hour TTL. |
-| `ReceivedObjectsBucket` | Stores reassembled objects; 28-day lifecycle expiry. Created by the stack unless provided as a parameter. |
-| `RoleForProxylity` | Allows Proxylity to deliver packets to the ingestion queue; principal and trust configuration loaded from the Proxylity config object in S3 |
-| `EncoderLambda` | Reads a file from S3, encodes it, and sends packets to a specified UDP endpoint. Useful for testing and to copy small files between buckets |
-
-The CloudFormation template [`template.json`](./template.json) also includes the scaffolding roles and other "wiring" resources. 
-
-## Packet Wire Format
-
-Each UDP datagram carries one encoded symbol using the RFC 6330 OTI layout, with non-RFC pipeline fields appended:
-
-```
-[ 1 byte  ] id_length              — byte length of the UTF-8 object ID
-[ N bytes ] object_id              — UTF-8 string (N = id_length); relative file path with optional prefix
-
-Common FEC OTI (RFC 6330 §8.1, 8 bytes, big-endian):
-  [ 5 bytes ] F (transfer_length)  — total object size in bytes (unsigned 40-bit)
-  [ 1 byte  ] reserved = 0
-  [ 2 bytes ] T (symbol_size)       — symbol size in bytes (unsigned 16-bit)
-
-Scheme-specific FEC OTI (RFC 6330 §8.2, 4 bytes):
-  [ 1 byte  ] Z (num_source_blocks) — total source blocks, 1..255
-  [ 2 bytes ] N (sub-blocks)        — always 1
-  [ 1 byte  ] Al (alignment)        — always 4
-
-FEC Payload ID (RFC 6330 §8.3, 4 bytes, big-endian):
-  [ 1 byte  ] SBN (source_block_number) — zero-based block index (0..Z-1)
-  [ 3 bytes ] ESI (encoding_symbol_id)  — symbol index within the block
-
-[ * bytes ] symbol_data       — the encoded symbol payload
-```
-
-The fixed portion of the header (`id_length` + OTI fields + FEC Payload ID) is **17 bytes**; the object ID (`id_length` bytes of UTF-8) is variable. The object ID is the relative file path with an optional timestamp prefix (e.g. `20260501120000/path/to/file.zip`). Max packet size is 1400 bytes, so the available symbol payload is `1400 − 17 − len(object_id)` bytes. The CLI enforces a maximum object ID length and chooses a symbol size between `MIN_SYMBOL_SIZE` (256) and `MAX_SYMBOL_SIZE` (1280) bytes by selecting the smallest power-of-2 source symbol count K that keeps each symbol within that range.
-
-Files larger than `MAX_BLOCK_BYTES` (512 KB) are split into multiple **source blocks**, each encoded and decoded independently. The SBN field is 1 byte, so up to 255 blocks are supported — a maximum file size of **~127 MB**. Each block has K = `MAX_BLOCK_BYTES / symbol_size` ≈ 512 source symbols. Single-block transfers (`num_blocks = 1`, `block_index = 0`) are backward-compatible with simple decoders that ignore the block fields.
-
-## DynamoDB Schema
-
-**Table key structure:** `PK` (string) + `SK` (string), single table. Three item types per transfer:
-
-### Overall metadata item
-
-This record is created once per `objectId` by the first Lambda to process any packet. Holds the S3 multipart upload ID shared by all per-block decode Lambdas.
-
-| Attribute | Type | Description |
-|---|---|---|
-| `PK` | S | `METADATA\|{ObjectId}` |
-| `SK` | S | `OVERALL` |
-| `NumBlocks` | N | Total number of source blocks in this transfer |
-| `TotalOriginalSize` | N | Total file size in bytes |
-| `CompletedBlocks` | N | Atomic counter — how many blocks have been decoded and uploaded |
-| `S3UploadId` | S | The S3 multipart upload ID; created by the first-writing Lambda, re-used by all others |
-| `IsFinalized` | BOOL | Set to `true` by the one Lambda that wins the `CompleteMultipartUpload` race; prevents duplicate finalizations |
-| `Expires` | N | Unix epoch TTL (4 hours from first packet) |
-
-### Block packet count item
-
-One item per source block. Tracks how many symbols have been received for the block; triggers block decode once the count reaches K. Per-block decode parameters (K, SymbolSize, NumBlocks, etc.) are carried in the `CompletionQueue` message payload rather than stored here.
-
-| Attribute | Type | Description |
-|---|---|---|
-| `PK` | S | `COUNT\|{ObjectId}` |
-| `SK` | S | `BLOCK\|{BlockIndex:D6}` (zero-padded for lexicographic order) |
-| `BlockIndex` | N | Zero-based block index |
-| `ReceivedPackets` | N | Atomic counter incremented as batches of symbols arrive for this block |
-| `Expires` | N | Unix epoch TTL (4 hours from first packet) |
-
-### Packet item
-
-One item per received symbol. The PK fans out across 6 sub-partitions (`a`–`f`) keyed by `PacketIndex % 6`, preventing hot-partition throttling when many symbols for a single block arrive concurrently.
-
-| Attribute | Type | Description |
-|---|---|---|
-| `PK` | S | `PACKET\|{ObjectId}\|{BlockIndex:D6}\|{a-f}` (sub-partition suffix = `'a' + PacketIndex % 6`) |
-| `SK` | S | `{PacketIndex:D10}` (zero-padded for ordering) |
-| `ObjectId` | S | GUID string |
-| `BlockIndex` | N | Source block index |
-| `PacketIndex` | N | Symbol index within the block |
-| `Data` | S | Base64-encoded symbol bytes |
-| `Timestamp` | N | Unix epoch seconds at write time |
-| `Expires` | N | Unix epoch TTL (4 hours from first packet) |
-
-
-## SQS Message Formats
-
-### IngestionQueue message
-
-Delivered by the Proxylity UDP Gateway. Each SQS record body is a JSON object wrapping one raw UDP datagram:
-
-```json
-{
-  "Data": "<base64-encoded raw UDP datagram>",
-  "IngressRegion": "<AWS region where the packet arrived>",
-  "Remote": {
-    "IpAddress": "<sender IP address>",
-    "Port": <sender UDP port>,
-    "PeerKey": "<WireGuard public key of the sender peer>"
-  }
-}
-```
-
-`Data` contains the full wire-format datagram described in the Packet Wire Format section above. Proxylity batches up to 10 datagrams per SQS message delivery (`Batching.Count = 10`, `TimeoutInSeconds = 0.05`).
-
-### CompletionQueue message (FIFO)
-
-Sent by `PacketIngestorLambda` once a block reaches at least K received symbols. The message body is a JSON-serialized `BlockCompleterPayload` carrying all decode parameters so `BlockCompleterLambda` can start work without an extra DDB lookup:
-
-```json
-{
-  "ObjectId": "<transfer GUID>",
-  "BlockIndex": <zero-based block index>,
-  "K": <source symbol count for this block>,
-  "SymbolSize": <bytes per symbol>,
-  "NumBlocks": <total source blocks in the transfer>,
-  "OriginalSize": <total file size in bytes>,
-  "BlockDataSize": <actual data bytes in this block, excluding symbol zero-padding>,
-  "EgressRegion": "<AWS region used for reply routing>",
-  "RemoteEp": "<ip>:<port> of the originating sender",
-  "PeerKey": "<WireGuard public key of the originating peer>"
-}
-```
-
-FIFO routing attributes set by the ingestor:
-
-| Attribute | Value | Purpose |
-|---|---|---|
-| `MessageGroupId` | `"{ObjectId}_{BlockIndex}"` | One group per block; ensures sequential processing within a block |
-| `MessageDeduplicationId` | `"{BlockIndex}"` | Deduplicated within the message group (`DeduplicationScope = messageGroup`), preventing duplicate decode triggers per block |
-
-## CLI Tool — `src/raptor-cli`
-
-A .NET console app targeting .Net 10 with native AoT compilation that:
-- Accepts a file/folder path and a UDP endpoint URI (`udp://host:port`) as arguments
-- Reads and encodes files using the shared `RaptorQEncoder` from `raptorq-lib`
-- Sends encoded symbols as UDP packets to the endpoint
-- Holds a steady send rate/bandwidth (defaults to 10 Mbps)
-- Waits for block confirmation (ACK) packets to verify each has been received
-
-```bash
-raptor foo.zip udp://ingress-1.proxylity.com:12345
-```
-
-## Shared Library — `src/raptorq-lib`
-
-A shared library targeting .Net 10 and implementing RaptorQ encoding and decoding per [RFC 6330](https://datatracker.ietf.org/doc/html/rfc6330).
-
-## Building the CLI app
-
-For best performance, publish the CLI project as a release build which will generate a small, depenendency free native executable:
-
-```bash
-# from the repo root folder 
-dotnet publish -o ./publish -c Release ./src/raptor-cli/raptor-cli.csproj
-```
-
-The executable will be located in the `publish` subfolder.
-
-## Deploying the Backend Service
-
-The CLI depends on a decoder endpoint provisioned in your AWS account. The backend provides the decoding of the Raptor-Q symbols back into files, and putting them to your S3 bucket. All of that happens in your own account, under your control.  If you have an existing bucket provide the ARN for it (including the prefix where you'd like the objects/files to appear).  If no bucket is specified the stack will automatically create one for you.
-
-> **Prerequisites:** `aws` CLI, `sam` CLI, and `.NET 10 SDK` installed and configured. Must be subscribed to [Proxylity UDP Gateway](https://aws.amazon.com/marketplace/pp/prodview-cpvl5wgt2yo2e) for the AWS account (free tier is available).
-
-The stack name must be **lowercase** — it is used as part of the S3 bucket name (`{stack}-objects-{accountId}`) when one is automatically created.
-
-```bash
-sam build && sam deploy --guided
-```
-
-To tear down the stack:
-
-```bash
-sam delete
-```
-
-## Testing
-
-```bash
-# Get the listener endpoint and bucket name from stack outputs (update stack name if needed)
-ENDPOINT=$(aws cloudformation describe-stacks --stack-name raptorq \
-  --query "Stacks[0].Outputs[?OutputKey=='DecoderListenerPort'].OutputValue" --output text)
-HOST=$(aws cloudformation describe-stacks --stack-name raptorq \
-  --query "Stacks[0].Outputs[?OutputKey=='DecoderListenerHost'].OutputValue" --output text)
-
-# Send a file to the backend
-raptor foo.zip udp://${HOST}:${ENDPOINT}
-
-# List reassembled objects in S3
-BUCKET=$(aws cloudformation describe-stacks --stack-name raptorq \
-  --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text)
-
-aws s3 ls s3://${BUCKET} --recursive
-
-# Compare transfer time: RaptorQ UDP vs direct S3 upload
-time raptor foo.zip udp://${HOST}:${ENDPOINT}
-time aws s3 cp foo.zip s3://${BUCKET}
-```
-
-# CLI Usage
-
-```
-Usage:
- raptor <file> <udp|wg>://<ip>:<port> [options]
-
-   <file>                   Path to the local file or folder to send.
-   [udp|wg]://<ip>:<port>   Backend endpoint (UDP or WireGuard).
-   --server-key <base64>    WireGuard public key of the server (required for wg://).
-   --client-key <base64>    WireGuard private key of the client (required for wg://).
-   --recursive              If <file> is a folder, include all subfolders (default: false).
-   --overhead <number>      Fraction of repair symbols above K (default: 0.05 = 5%).
-   --rate-mbps <number>     Max send rate in Mbps (default: 10).
-   --block-timeout <number> Seconds to wait for a block confirmation before retrying 
-                            (default: 2, 0 = disabled).
-   --confirm <flags>        Wait for confirmations from backend 
-                            [NONE, ANY = PACKETS | BLOCK | FILE, PACKETS, BLOCK, FILE] 
-                            (default: ANY).
-   --verbose                Print detailed encoding and progress information.
-   --silent                 Suppress all output except usage errors.
-   --no-prefix              Don't prefix object IDs with timestamps; use relative paths only.
-
- Examples:
-   raptor myfile.zip udp://203.0.113.42:2048 --overhead 0.10 --rate-mbps 10
-   raptor myfile.zip udp://203.0.113.42:2048 --block-timeout 5
-   raptor myFolder wg://203.0.113.42:2048 --server-key <base64> \
-     --client-key <base64> --recursive --verbose
-```
+| `src/raptor2-cli` | The `raptor2` CLI (NativeAOT; built and tested on Linux and Windows) |
+| `src/raptor2-microvm` | The MicroVM app: receives batches on port 8080, lifecycle hooks on 9000, writes to S3 |
+| `src/raptor2-wire` | Packet formats, file layout and slot routing, shared by the CLI and the MicroVM |
+| `src/raptorq-lib` | RaptorQ encoder and decoder ([RFC 6330](https://datatracker.ietf.org/doc/html/rfc6330)), GF(256) with SIMD |
+| `src/raptor2-localgw` | A local stand-in for the gateway, for testing without AWS |
+| `src/raptor2-tests`, `src/raptorq-tests` | Unit and integration tests |
+| `microvm/` | SAM template, MicroVM image `Dockerfile`, build, deploy and test scripts |
+| `bench/` | `benchmark.sh` (creates no AWS resources), `loss-benchmark.sh` (simulated loss with `tc netem`), `selftest.sh`, `charts.py` |
+| `docs/` | [Design](docs/design-microvm.md), [benchmarks](docs/benchmarks/), [the original design](docs/original-design.md) |
+| `template.json`, `src/raptor-cli`, `src/raptorq-*` Lambdas | The original Lambda + SQS + DynamoDB version |
 
 # License
 
-This project is released under the [MIT License](LICENSE). You are free to use, modify, and distribute it in both commercial and non-commercial projects.
+This project is released under the [MIT License](LICENSE). You are free to use, modify, and distribute it in both
+commercial and non-commercial projects.

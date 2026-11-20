@@ -1,4 +1,7 @@
-# Raptor — Cloud Cost Analysis
+# Raptor — Cloud Cost Analysis (original design)
+
+> This analysis is for the [original Lambda + SQS + DynamoDB design](original-design.md). For the current design's
+> costs, see the [readme](../readme.md#cost).
 
 > S3 API costs are excluded; only the incremental costs introduced by the RaptorQ
 > pipeline (DynamoDB, Lambda, Proxylity) are considered.

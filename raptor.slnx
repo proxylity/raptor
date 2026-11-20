@@ -4,6 +4,13 @@
     <Project Path="src/raptorq-lib/raptorq-lib.csproj" />
     <Project Path="src/raptorq-tests/raptorq-tests.csproj" />
   </Folder>
+  <Folder Name="/src/raptor2/">
+    <Project Path="src/raptor2-cli/raptor2-cli.csproj" />
+    <Project Path="src/raptor2-localgw/raptor2-localgw.csproj" />
+    <Project Path="src/raptor2-microvm/raptor2-microvm.csproj" />
+    <Project Path="src/raptor2-tests/raptor2-tests.csproj" />
+    <Project Path="src/raptor2-wire/raptor2-wire.csproj" />
+  </Folder>
   <Folder Name="/src/raptorq-block-completer/">
     <Project Path="src/raptorq-block-completer/Function.csproj" />
   </Folder>

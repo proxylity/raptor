@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="460" viewBox="0 0 920 460" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="920" height="460" fill="white"/>
+<text x="70" y="30" font-size="19" font-weight="600" fill="#212529">Files per second until durable in S3</text>
+<text x="70" y="52" font-size="13" fill="#495057">Median of the verified runs. Higher is better.</text>
+<line x1="70" y1="368.0" x2="900" y2="368.0" stroke="#e9ecef"/>
+<text x="62" y="372.0" font-size="12" text-anchor="end" fill="#868e96">1</text>
+<line x1="70" y1="295.5" x2="900" y2="295.5" stroke="#e9ecef"/>
+<text x="62" y="299.5" font-size="12" text-anchor="end" fill="#868e96">10</text>
+<line x1="70" y1="223.0" x2="900" y2="223.0" stroke="#e9ecef"/>
+<text x="62" y="227.0" font-size="12" text-anchor="end" fill="#868e96">100</text>
+<line x1="70" y1="150.5" x2="900" y2="150.5" stroke="#e9ecef"/>
+<text x="62" y="154.5" font-size="12" text-anchor="end" fill="#868e96">1,000</text>
+<line x1="70" y1="78.0" x2="900" y2="78.0" stroke="#e9ecef"/>
+<text x="62" y="82.0" font-size="12" text-anchor="end" fill="#868e96">10,000</text>
+<text x="18" y="223" font-size="12" fill="#495057" transform="rotate(-90 18 223)" text-anchor="middle">files / second (log scale)</text>
+<rect x="106.2" y="329.3" width="32.0" height="38.7" fill="#9aa5b1"/>
+<text x="122.2" y="325.3" font-size="10.5" text-anchor="middle" fill="#343a40">3.42</text>
+<rect x="140.2" y="198.5" width="32.0" height="169.5" fill="#e8590c"/>
+<text x="156.2" y="194.5" font-size="10.5" text-anchor="middle" fill="#343a40">218</text>
+<text x="139.2" y="388" font-size="13" text-anchor="middle" fill="#212529">100 × 1KiB</text>
+<rect x="244.5" y="326.9" width="32.0" height="41.1" fill="#9aa5b1"/>
+<text x="260.5" y="322.9" font-size="10.5" text-anchor="middle" fill="#343a40">3.69</text>
+<rect x="278.5" y="152.1" width="32.0" height="215.9" fill="#e8590c"/>
+<text x="294.5" y="148.1" font-size="10.5" text-anchor="middle" fill="#343a40">951</text>
+<text x="277.5" y="388" font-size="13" text-anchor="middle" fill="#212529">500 × 1KiB</text>
+<text x="402.8" y="362" font-size="11" text-anchor="start" fill="#868e96" transform="rotate(-90 398.8 362)">incomplete</text>
+<rect x="416.8" y="145.5" width="32.0" height="222.5" fill="#e8590c"/>
+<text x="432.8" y="141.5" font-size="10.5" text-anchor="middle" fill="#343a40">1,172</text>
+<text x="415.8" y="388" font-size="13" text-anchor="middle" fill="#212529">1,000 × 1KiB</text>
+<rect x="521.2" y="329.7" width="32.0" height="38.3" fill="#9aa5b1"/>
+<text x="537.2" y="325.7" font-size="10.5" text-anchor="middle" fill="#343a40">3.37</text>
+<rect x="555.2" y="204.0" width="32.0" height="164.0" fill="#e8590c"/>
+<text x="571.2" y="200.0" font-size="10.5" text-anchor="middle" fill="#343a40">183</text>
+<text x="554.2" y="388" font-size="13" text-anchor="middle" fill="#212529">100 × 10KiB</text>
+<rect x="659.5" y="326.8" width="32.0" height="41.2" fill="#9aa5b1"/>
+<text x="675.5" y="322.8" font-size="10.5" text-anchor="middle" fill="#343a40">3.70</text>
+<rect x="693.5" y="192.2" width="32.0" height="175.8" fill="#e8590c"/>
+<text x="709.5" y="188.2" font-size="10.5" text-anchor="middle" fill="#343a40">266</text>
+<text x="692.5" y="388" font-size="13" text-anchor="middle" fill="#212529">500 × 10KiB</text>
+<text x="817.8" y="362" font-size="11" text-anchor="start" fill="#868e96" transform="rotate(-90 813.8 362)">incomplete</text>
+<rect x="831.8" y="190.0" width="32.0" height="178.0" fill="#e8590c"/>
+<text x="847.8" y="186.0" font-size="10.5" text-anchor="middle" fill="#343a40">285</text>
+<text x="830.8" y="388" font-size="13" text-anchor="middle" fill="#212529">1,000 × 10KiB</text>
+<line x1="70" y1="368" x2="900" y2="368" stroke="#adb5bd"/>
+<rect x="70" y="426" width="12" height="12" fill="#9aa5b1"/>
+<text x="88" y="436" font-size="13" fill="#212529">raptor, Lambda + DynamoDB</text>
+<rect x="285.0" y="426" width="12" height="12" fill="#e8590c"/>
+<text x="303.0" y="436" font-size="13" fill="#212529">raptor, Lambda MicroVMs</text>
+</svg>

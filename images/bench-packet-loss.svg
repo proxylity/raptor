@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="460" viewBox="0 0 920 460" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="920" height="460" fill="white"/>
+<text x="70" y="30" font-size="19" font-weight="600" fill="#212529">Upload time with packet loss: 500 × 10KiB</text>
+<text x="70" y="52" font-size="13" fill="#495057">Outbound loss from tc netem. Line: median of 3 runs; bar: fastest to slowest run. Lower is better.</text>
+<line x1="70" y1="368.0" x2="890" y2="368.0" stroke="#e9ecef"/>
+<text x="62" y="372.0" font-size="12" text-anchor="end" fill="#868e96">0</text>
+<line x1="70" y1="271.3" x2="890" y2="271.3" stroke="#e9ecef"/>
+<text x="62" y="275.3" font-size="12" text-anchor="end" fill="#868e96">10</text>
+<line x1="70" y1="174.7" x2="890" y2="174.7" stroke="#e9ecef"/>
+<text x="62" y="178.7" font-size="12" text-anchor="end" fill="#868e96">20</text>
+<line x1="70" y1="78.0" x2="890" y2="78.0" stroke="#e9ecef"/>
+<text x="62" y="82.0" font-size="12" text-anchor="end" fill="#868e96">30</text>
+<text x="18" y="223" font-size="12" fill="#495057" transform="rotate(-90 18 223)" text-anchor="middle">seconds until in S3</text>
+<text x="152.0" y="388" font-size="13" text-anchor="middle" fill="#212529">0% loss</text>
+<text x="316.0" y="388" font-size="13" text-anchor="middle" fill="#212529">1% loss</text>
+<text x="480.0" y="388" font-size="13" text-anchor="middle" fill="#212529">5% loss</text>
+<text x="644.0" y="388" font-size="13" text-anchor="middle" fill="#212529">10% loss</text>
+<text x="808.0" y="388" font-size="13" text-anchor="middle" fill="#212529">20% loss</text>
+<line x1="70" y1="368" x2="890" y2="368" stroke="#adb5bd"/>
+<line x1="147.0" y1="350.3" x2="147.0" y2="345.3" stroke="#e8590c" stroke-width="6" stroke-opacity="0.35" stroke-linecap="round"/>
+<line x1="311.0" y1="347.9" x2="311.0" y2="345.2" stroke="#e8590c" stroke-width="6" stroke-opacity="0.35" stroke-linecap="round"/>
+<line x1="475.0" y1="346.8" x2="475.0" y2="346.2" stroke="#e8590c" stroke-width="6" stroke-opacity="0.35" stroke-linecap="round"/>
+<line x1="639.0" y1="346.5" x2="639.0" y2="340.7" stroke="#e8590c" stroke-width="6" stroke-opacity="0.35" stroke-linecap="round"/>
+<line x1="803.0" y1="339.0" x2="803.0" y2="337.3" stroke="#e8590c" stroke-width="6" stroke-opacity="0.35" stroke-linecap="round"/>
+<polyline fill="none" stroke="#e8590c" stroke-width="2.5" points="147.0,349.9 311.0,346.3 475.0,346.4 639.0,345.4 803.0,337.9"/>
+<circle cx="147.0" cy="349.9" r="4" fill="#e8590c"/>
+<text x="147.0" y="367.9" font-size="11" font-weight="600" text-anchor="middle" fill="#e8590c">1.88</text>
+<circle cx="311.0" cy="346.3" r="4" fill="#e8590c"/>
+<text x="311.0" y="364.3" font-size="11" font-weight="600" text-anchor="middle" fill="#e8590c">2.24</text>
+<circle cx="475.0" cy="346.4" r="4" fill="#e8590c"/>
+<text x="475.0" y="364.4" font-size="11" font-weight="600" text-anchor="middle" fill="#e8590c">2.24</text>
+<circle cx="639.0" cy="345.4" r="4" fill="#e8590c"/>
+<text x="639.0" y="363.4" font-size="11" font-weight="600" text-anchor="middle" fill="#e8590c">2.33</text>
+<circle cx="803.0" cy="337.9" r="4" fill="#e8590c"/>
+<text x="803.0" y="355.9" font-size="11" font-weight="600" text-anchor="middle" fill="#e8590c">3.11</text>
+<line x1="157.0" y1="351.7" x2="157.0" y2="350.7" stroke="#1c7ed6" stroke-width="6" stroke-opacity="0.35" stroke-linecap="round"/>
+<line x1="321.0" y1="351.5" x2="321.0" y2="336.5" stroke="#1c7ed6" stroke-width="6" stroke-opacity="0.35" stroke-linecap="round"/>
+<line x1="485.0" y1="347.4" x2="485.0" y2="342.2" stroke="#1c7ed6" stroke-width="6" stroke-opacity="0.35" stroke-linecap="round"/>
+<line x1="649.0" y1="333.3" x2="649.0" y2="324.3" stroke="#1c7ed6" stroke-width="6" stroke-opacity="0.35" stroke-linecap="round"/>
+<line x1="813.0" y1="292.5" x2="813.0" y2="129.7" stroke="#1c7ed6" stroke-width="6" stroke-opacity="0.35" stroke-linecap="round"/>
+<polyline fill="none" stroke="#1c7ed6" stroke-width="2.5" points="157.0,351.1 321.0,349.4 485.0,342.5 649.0,331.3 813.0,175.5"/>
+<circle cx="157.0" cy="351.1" r="4" fill="#1c7ed6"/>
+<text x="157.0" y="341.1" font-size="11" font-weight="600" text-anchor="middle" fill="#1c7ed6">1.75</text>
+<circle cx="321.0" cy="349.4" r="4" fill="#1c7ed6"/>
+<text x="321.0" y="339.4" font-size="11" font-weight="600" text-anchor="middle" fill="#1c7ed6">1.92</text>
+<circle cx="485.0" cy="342.5" r="4" fill="#1c7ed6"/>
+<text x="485.0" y="332.5" font-size="11" font-weight="600" text-anchor="middle" fill="#1c7ed6">2.64</text>
+<circle cx="649.0" cy="331.3" r="4" fill="#1c7ed6"/>
+<text x="649.0" y="321.3" font-size="11" font-weight="600" text-anchor="middle" fill="#1c7ed6">3.80</text>
+<circle cx="813.0" cy="175.5" r="4" fill="#1c7ed6"/>
+<text x="813.0" y="165.5" font-size="11" font-weight="600" text-anchor="middle" fill="#1c7ed6">19.9</text>
+<rect x="70" y="426" width="12" height="12" fill="#e8590c"/>
+<text x="88" y="436" font-size="13" fill="#212529">raptor, Lambda MicroVMs</text>
+<rect x="270.20000000000005" y="426" width="12" height="12" fill="#1c7ed6"/>
+<text x="288.20000000000005" y="436" font-size="13" fill="#212529">AWS CLI native preview</text>
+</svg>

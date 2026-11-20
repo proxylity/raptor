@@ -1,0 +1,296 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  raptor2: RaptorQ-over-UDP uploads to S3 through Proxylity UDP Gateway and Lambda MicroVMs. The client writes a
+  slot number into byte 1 of every datagram; the destination uses it as the tenant, so each slot is one long-lived
+  MicroVM that decodes blocks in memory and uploads them to S3. No DynamoDB, no queues.
+  Requires a Proxylity UDP Gateway subscription and Lambda MicroVMs in the region.
+
+Parameters:
+  ClientCidrToAllow:
+    Description: CIDR allowed to send to the listener, for example 203.0.113.10/32 (microvm/scripts/deploy.sh fills in your public IP).
+    Type: String
+    AllowedPattern: '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$'
+  Protocol:
+    Description: Listener protocol. wg needs PeerPublicKey.
+    Type: String
+    Default: udp
+    AllowedValues: [udp, wg]
+  PeerPublicKey:
+    Description: WireGuard public key (base64) of the client, when Protocol is wg.
+    Type: String
+    Default: ""
+  ExistingBucketName:
+    Description: Existing bucket for the objects. Empty creates one named <stack>-objects-<account>.
+    Type: String
+    Default: ""
+  BucketPrefix:
+    Description: Prefix for object keys (and for the small .raptor/ marker objects used to coordinate multipart uploads).
+    Type: String
+    Default: "decoded/"
+  Architecture:
+    Description: MicroVM CPU architecture. Must match the NativeAOT build (publish.sh RID).
+    Type: String
+    Default: X86_64
+    AllowedValues: [X86_64, ARM_64]
+  BaseImageVersion:
+    Description: al2023-1 MicroVM base image version (x86_64 needs 3 or later). deploy.sh picks the newest.
+    Type: String
+    Default: "3"
+  MemoryMiB:
+    Description: >
+      Baseline MicroVM memory. Each slot holds a 16-128 MiB buffer per part being received on it; the app caps buffers
+      at 60% of memory and drops (and later repairs) packets beyond that.
+    Type: Number
+    Default: 2048
+    AllowedValues: [1024, 2048, 4096, 8192]
+  IdleDurationSeconds:
+    Description: Seconds without packets before a slot's MicroVM is suspended (60-28800). Memory survives; the next packet resumes it.
+    Type: String
+    Default: "900"
+  BatchCount:
+    Description: Packets per delivery to a MicroVM; a batch is also sent 100 ms after its first packet.
+    Type: Number
+    Default: 1000
+    MinValue: 10
+    MaxValue: 2000
+Conditions:
+  CreateBucket: !Equals [!Ref ExistingBucketName, ""]
+  IsWireGuard: !Equals [!Ref Protocol, wg]
+
+Mappings:
+  ProxylityConfig:
+    Fn::Transform:
+      Name: AWS::Include
+      Parameters:
+        Location: !Sub "s3://proxylity-config-${AWS::Region}/${AWS::AccountId}/customer-config.json"
+
+Resources:
+  ObjectsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateBucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-objects-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireObjects
+            Status: Enabled
+            ExpirationInDays: 28
+          - Id: ExpireCoordinationMarkers
+            Status: Enabled
+            Prefix: !Sub "${BucketPrefix}.raptor/"
+            ExpirationInDays: 2
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 2
+
+  # Image build logs, and the MicroVMs' runtime output (one JSON line per commit and a stats line every 30 s).
+  # Running MicroVMs write to Lambda's default group /aws/lambda-microvms/<image-name> with the execution role.
+  MicrovmLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda-microvms/${AWS::StackName}-decoder"
+      RetentionInDays: 7
+
+  DecoderImage:
+    Type: AWS::Serverless::MicrovmImage
+    Properties:
+      Name: !Sub "${AWS::StackName}-decoder"
+      Description: raptor2 RaptorQ decoder for Proxylity UDP Gateway.
+      CodeUri: build/image/
+      BaseImageArn: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:microvm-image:al2023-1"
+      BaseImageVersion: !Ref BaseImageVersion
+      CpuConfigurations:
+        - Architecture: !Ref Architecture
+      Resources:
+        - MinimumMemoryInMiB: !Ref MemoryMiB
+      Logging:
+        CloudWatch:
+          LogGroup: !Ref MicrovmLogs
+      Hooks:
+        Port: 9000
+        MicrovmImageHooks:
+          Ready: ENABLED
+          ReadyTimeoutInSeconds: 60
+        MicrovmHooks:
+          Run: ENABLED
+          RunTimeoutInSeconds: 10
+
+  # What the app inside each MicroVM may do: write objects and parts under the prefix, read and create the
+  # coordination markers, list and abort its multipart uploads, and write its logs.
+  MicrovmExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      Policies:
+        - PolicyName: objects
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}/${BucketPrefix}*"
+                  - Bucket: !If [CreateBucket, !Ref ObjectsBucket, !Ref ExistingBucketName]
+              # Without ListBucket, reading a marker that doesn't exist yet returns 403 instead of 404.
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:s3:::${Bucket}"
+                  - Bucket: !If [CreateBucket, !Ref ObjectsBucket, !Ref ExistingBucketName]
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub "${BucketPrefix}.raptor/*"
+        - PolicyName: runtime-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogs}"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${MicrovmLogs}:*"
+
+  DeliveryLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/proxylity/udp-listeners/${AWS::StackName}"
+      RetentionInDays: 7
+
+  # Assumed by Proxylity to start MicroVMs from the image and get tokens to post batches to them.
+  DestinationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !FindInMap [ProxylityConfig, !Ref AWS::Region, ServiceRole]
+            Action: sts:AssumeRole
+
+  DestinationPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-destination-policy"
+      Roles:
+        - !Ref DestinationRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: MicrovmsFromThisImage
+            Effect: Allow
+            Action:
+              - lambda:RunMicrovm
+              - lambda:GetMicrovm
+              - lambda:ResumeMicrovm
+              - lambda:TerminateMicrovm
+              - lambda:GetMicrovmImage
+              - lambda:GetMicrovmImageVersion
+              - lambda:CreateMicrovmAuthToken
+            Resource: !GetAtt DecoderImage.ImageArn
+          # HTTPS ingress for packet delivery, and internet egress so the app can reach S3.
+          - Sid: PassNetworkConnectors
+            Effect: Allow
+            Action: lambda:PassNetworkConnector
+            Resource:
+              - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:HTTP_INGRESS"
+              - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
+          - Sid: PassMicrovmExecutionRole
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt MicrovmExecutionRole.Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: lambda.amazonaws.com
+          - Sid: CloudWatchMetrics
+            Effect: Allow
+            Action: cloudwatch:PutMetricData
+            Resource: "*"
+          - Sid: DeliveryLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "${DeliveryLogs.Arn}:*"
+
+  DecoderListener:
+    Type: Custom::ProxylityUdpGatewayListener
+    DependsOn: DestinationPolicy
+    Properties:
+      ServiceToken: !FindInMap [ProxylityConfig, !Ref AWS::Region, ServiceToken]
+      ApiKey: !FindInMap [ProxylityConfig, Account, ApiKey]
+      Protocols:
+        - !Ref Protocol
+      Peers: !If
+        - IsWireGuard
+        - - PublicKey: !Ref PeerPublicKey
+        - !Ref AWS::NoValue
+      ClientRestrictions:
+        Networks:
+          - !Ref ClientCidrToAllow
+      Destinations:
+        - Name: RaptorDecoder
+          Description: RaptorQ symbols to the slot's MicroVM, which decodes them in memory and writes to S3.
+          Role:
+            Arn: !GetAtt DestinationRole.Arn
+          Formatter: base64
+          Batching:
+            Count: !Ref BatchCount
+            TimeoutInSeconds: 0.1
+          MetricsEnabled: true
+          LogGroupName: !Ref DeliveryLogs
+          DestinationArn: !GetAtt DecoderImage.ImageArn
+          Arguments:
+            # Byte 1 of every datagram is the slot the client computed from the transfer ID and the file (small files)
+            # or the part (larger files). One slot is one MicroVM, shared by all transfers, so it stays warm.
+            TenantIdExpression: "[1:2]"
+            TenantIdFormatter: hex
+            IdleDurationSeconds: !Ref IdleDurationSeconds
+            ExecutionRoleArn: !GetAtt MicrovmExecutionRole.Arn
+            RunHookExtraData: !Sub
+              - '{"Bucket":"${Bucket}","Prefix":"${BucketPrefix}","LogCommits":true}'
+              - Bucket: !If [CreateBucket, !Ref ObjectsBucket, !Ref ExistingBucketName]
+Outputs:
+  DecoderListenerHost:
+    Value: !Sub "${DecoderListener.Domain}.proxylity.com"
+  DecoderListenerPort:
+    Value: !GetAtt DecoderListener.Port
+  DecoderListenerPublicKey:
+    Condition: IsWireGuard
+    Value: !GetAtt DecoderListener.WireGuardPublicKey
+  BucketName:
+    Value: !If [CreateBucket, !Ref ObjectsBucket, !Ref ExistingBucketName]
+  BucketPrefix:
+    Value: !Ref BucketPrefix
+  MicrovmImageArn:
+    Value: !GetAtt DecoderImage.ImageArn
+  MicrovmLogGroup:
+    Value: !Ref MicrovmLogs
+  DeliveryLogGroup:
+    Value: !Ref DeliveryLogs
